@@ -1,0 +1,17 @@
+name: youtube-downloader
+services:
+  youtube:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: yt-dlp-api:latest
+    container_name: yt-dlp-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DATA_DIR=/data
+      - PORT=8000
+      - YTDLP_UPDATE=1
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
