@@ -270,7 +270,7 @@ def download_audio(
         "--no-playlist",
         "--format", quality,
         "--extract-audio",
-        "--audio-format", "mp4",
+        "--audio-format", "m4a",
         target,
     ]
     result = run_download(args, out_dir)
