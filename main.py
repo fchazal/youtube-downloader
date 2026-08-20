@@ -93,11 +93,17 @@ def embed_thumbnail(video_file: Path, info: dict, url: str) -> None:
         with urllib.request.urlopen(req, timeout=60) as resp:
             thumb.write_bytes(resp.read())
 
+        thumb_png = Path(tmp) / "thumb.png"
+        subprocess.run(
+            ["ffmpeg", "-y", "-i", str(thumb), str(thumb_png)],
+            capture_output=True, text=True,
+        )
+
         out = video_file.parent / f".tmp.{video_file.name}"
         cmd = [
             "ffmpeg", "-y",
             "-i", str(video_file),
-            "-i", str(thumb),
+            "-i", str(thumb_png),
             "-map", "0", "-map", "1",
             "-c", "copy",
             "-disposition:v:1", "attached_pic",
