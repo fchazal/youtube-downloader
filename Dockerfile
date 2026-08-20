@@ -68,7 +68,11 @@ COPY main.py .
 # - js-runtimes deno: use Deno as the JS runtime for YouTube challenge solving
 # - remote-components ejs:github: auto-download EJS scripts from GitHub as fallback
 # - youtubepot-bgutilhttp: connect to local bgutil HTTP server for PO tokens
-RUN printf '--js-runtimes deno\n--remote-components ejs:github\n--extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"\n' > /etc/yt-dlp.conf
+RUN cat > /etc/yt-dlp.conf <<'EOF'
+--js-runtimes deno
+--remote-components ejs:github
+--extractor-args "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"
+EOF
 
 ENV DATA_DIR=/data
 ENV YTDLP_UPDATE=1
