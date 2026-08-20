@@ -3,6 +3,12 @@
 Dockerized HTTP API around [yt-dlp](https://github.com/yt-dlp/yt-dlp) for fetching
 video metadata and downloading media into a configurable data directory.
 
+YouTube requires EJS (External JS Scripts) for challenge solving and PO Tokens
+(Proof of Origin) to bypass bot detection. Both are handled automatically in the
+Docker image via Deno and the
+[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+plugin.
+
 > Published to CasaOS through the separate **casaos-store** repository, which
 > builds this app from its git URL.
 
@@ -10,7 +16,7 @@ video metadata and downloading media into a configurable data directory.
 
 | Method | Path                    | Description                                  |
 | ------ | ----------------------- | -------------------------------------------- |
-| GET    | `/`                     | Health check + yt-dlp version                |
+| GET    | `/`                     | Health check + yt-dlp version + PO token provider status |
 | GET    | `/info/{id}`           | Full metadata/properties for a video ID     |
 | GET    | `/formats/{id}`        | List of available formats/qualities         |
 | GET    | `/transcript/{id}`     | Single-line plain-text transcript (auto subs, original language) |
@@ -144,6 +150,14 @@ Interactive API docs: http://localhost:8000/docs
 
 - **Up-to-date yt-dlp**: the image downloads the standalone yt-dlp binary
   (not pip), so `yt-dlp -U` at startup keeps it current without rebuilds.
+- **EJS (External JS Scripts)**: YouTube now requires solving JavaScript
+  challenges. [Deno](https://deno.com) is installed as the JS runtime, and yt-dlp
+  is configured with `--js-runtimes deno` + `--remote-components ejs:github`.
+- **PO Tokens (Proof of Origin)**: YouTube enforces BotGuard attestation tokens.
+  The [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+  plugin runs an HTTP server on port 4416 inside the container, generating PO
+  tokens automatically via BgUtils. The health endpoint reports
+  `pot_provider: "ok" | "unavailable"`.
 - **ffmpeg** is bundled for audio extraction, format merging, subtitle embedding,
   thumbnail cover-art.
 - **WebDAV** is served by `wsgidav` (read-only), mounted at `/dav` over

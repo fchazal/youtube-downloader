@@ -8,6 +8,12 @@ A Dockerized HTTP API around [yt-dlp](https://github.com/yt-dlp/yt-dlp) that let
 you fetch video metadata, list available formats/qualities, and download
 videos/audio/subtitles into a subdirectory of a configurable data directory.
 
+YouTube requires EJS (External JS Scripts) for challenge solving and PO Tokens
+(Proof of Origin) to avoid bot detection. Both are handled automatically via
+[Deno](https://deno.com) and the
+[bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+plugin running an HTTP server on port 4416 inside the container.
+
 It is published as the **`youtube`** app of the CasaOS store
 (`/Users/fchazal/Developer/casaos-store`), which builds the image on the server
 from this repo's git URL.
@@ -16,6 +22,8 @@ from this repo's git URL.
 
 - Python 3.12 + **FastAPI** + **uvicorn** (synchronous endpoints; yt-dlp runs in a subprocess)
 - **yt-dlp standalone binary** (installed in the image, self-updates at startup)
+- **Deno** JS runtime (EJS challenge solving + bgutil PO token server)
+- **bgutil-ytdlp-pot-provider** (PO Token generation via BotGuard attestation)
 - **ffmpeg** (audio extraction, format merging, subtitle embedding)
 - Docker (multi-stage build), Docker Compose for local dev
 
@@ -42,6 +50,18 @@ Current version: `1.0.0` (FastAPI app version + image tag `yt-dlp-api:latest`).
 - The API **shells out to the `yt-dlp` binary** via `subprocess.run` (not the
   Python module). This keeps the binary the single source of truth and lets it
   self-update with `yt-dlp -U`.
+- **EJS (External JS Scripts)**: YouTube now requires solving JavaScript challenges
+  for video extraction. Deno is installed in the container as the JS runtime, and
+  yt-dlp is configured with `--js-runtimes deno` + `--remote-components ejs:github`
+  (fallback). EJS scripts are bundled with the yt-dlp standalone binary.
+- **PO Tokens (Proof of Origin)**: YouTube enforces BotGuard attestation tokens to
+  block automated access. The
+  [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
+  plugin is installed in `~/.config/yt-dlp/plugins/` and connects to an HTTP server
+  (`http://127.0.0.1:4416`) running inside the container. The server uses Deno +
+  BgUtils to generate PO tokens per-video. The `--extractor-args
+  "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"` flag is set in
+  `/etc/yt-dlp.conf`. The health endpoint reports `pot_provider: "ok" | "unavailable"`.
 - `normalize_target()` wraps a bare video ID into
   `https://www.youtube.com/watch?v=<id>`. **URLs are not accepted** — the routes
   use `{id}`, so only bare IDs work.
@@ -70,7 +90,7 @@ Current version: `1.0.0` (FastAPI app version + image tag `yt-dlp-api:latest`).
 
 | Method | Path                    | Description                          |
 | ------ | ----------------------- | ------------------------------------ |
-| GET    | `/`                     | Health + yt-dlp version + data_dir   |
+| GET    | `/`                     | Health + yt-dlp version + data_dir + pot_provider status |
 | GET    | `/info/{id}`           | Full yt-dlp metadata JSON            |
 | GET    | `/formats/{id}`        | Clean table of available formats     |
 | GET    | `/transcript/{id}`     | Plain-text transcript → `$DATA_DIR/transcripts/<video_id>.txt` |
@@ -209,7 +229,8 @@ Done: info / formats / transcript endpoints, REST download interface
 (`GET /video?quality=&ext=`, `GET /audio?quality=&format=` with raw yt-dlp
 selectors), thumbnail embedding + metadata on videos, read-only WebDAV (`/dav`,
 wsgidav), `DATA_DIR` env, Docker image, local compose, publish script, CasaOS
-store app entry.
+store app entry, EJS support (Deno JS runtime), PO Token provider
+(bgutil-ytdlp-pot-provider HTTP server on port 4416).
 
 Possible next steps (not started): async downloads with job status, web UI,
 playlist export, per-request rate limiting, authentication, tests

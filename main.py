@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import socket
 import subprocess
 import tempfile
 import urllib.request
@@ -118,13 +119,24 @@ def embed_thumbnail(video_file: Path, info: dict, url: str) -> None:
         out.replace(video_file)
 
 
+def _check_pot_server() -> bool:
+    """Check if the bgutil PO token HTTP server is reachable on port 4416."""
+    try:
+        with socket.create_connection(("127.0.0.1", 4416), timeout=2) as sock:
+            return True
+    except (OSError, ConnectionRefusedError):
+        return False
+
+
 @app.get("/")
 def health():
     proc = run_ytdlp(["--version"])
+    pot_ok = _check_pot_server()
     return {
         "status": "ok",
         "yt_dlp_version": proc.stdout.strip() or "unknown",
         "data_dir": str(DATA_DIR),
+        "pot_provider": "ok" if pot_ok else "unavailable",
     }
 
 
