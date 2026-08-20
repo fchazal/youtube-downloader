@@ -57,13 +57,17 @@ def normalize_target(video_id: str) -> str:
     return f"https://www.youtube.com/watch?v={video_id}"
 
 
-def run_download(args: list[str], out_dir: Path) -> dict:
-    """Run yt-dlp and return the file listing written to out_dir."""
+def run_download(args: list[str], out_dir: Path) -> str:
+    """Run yt-dlp and return the name of the newly created file."""
+    before = {p.name for p in out_dir.iterdir()}
     proc = run_ytdlp(args)
     if proc.returncode != 0:
         raise HTTPException(status_code=502, detail=proc.stderr.strip())
-    files = sorted(p.name for p in out_dir.iterdir())
-    return {"ok": True, "directory": str(out_dir), "files": files}
+    after = {p.name for p in out_dir.iterdir()}
+    new_names = after - before
+    if new_names:
+        return max(new_names, key=lambda n: (out_dir / n).stat().st_size)
+    return max(after, key=lambda n: (out_dir / n).stat().st_size)
 
 
 def get_info_json(target: str) -> dict:
@@ -75,6 +79,17 @@ def get_info_json(target: str) -> dict:
         return json.loads(proc.stdout)
     except json.JSONDecodeError:
         raise HTTPException(status_code=500, detail="Failed to parse yt-dlp output")
+
+
+def _build_response(info: dict, dav_path: str) -> dict:
+    """Build a standardized response from yt-dlp info and the dav path."""
+    return {
+        "title": info.get("title"),
+        "upload_date": info.get("upload_date"),
+        "channel_id": info.get("channel_id"),
+        "channel": info.get("channel"),
+        "dav_path": dav_path,
+    }
 
 
 def embed_thumbnail(video_file: Path, info: dict, url: str) -> None:
@@ -105,7 +120,8 @@ def embed_thumbnail(video_file: Path, info: dict, url: str) -> None:
             "-i", str(video_file),
             "-i", str(thumb_png),
             "-map", "0", "-map", "1",
-            "-c", "copy",
+            "-c:a", "copy",
+            "-c:v", "png",
             "-disposition:v:1", "attached_pic",
             "-metadata", f"title={title}",
             "-metadata", f"network={url}",
@@ -140,16 +156,9 @@ def health():
     }
 
 
-@app.get("/info/{id}")
-def get_info(id: str):
-    """Return metadata/properties for a YouTube video ID."""
-    target = normalize_target(id)
-    return get_info_json(target)
-
-
-@app.get("/formats/{id}")
-def list_formats(id: str):
-    """Return the available download formats/qualities for a video ID."""
+@app.get("/about/{id}")
+def get_about(id: str):
+    """Return metadata and available formats for a YouTube video ID."""
     target = normalize_target(id)
     info = get_info_json(target)
 
@@ -170,19 +179,25 @@ def list_formats(id: str):
             }
         )
     rows = [r for r in rows if r["video_codec"] != "none" or r["audio_codec"] != "none"]
-    return {"video_id": info.get("id"), "title": info.get("title"), "formats": rows}
+
+    return {
+        "title": info.get("title"),
+        "upload_date": info.get("upload_date"),
+        "channel_id": info.get("channel_id"),
+        "channel": info.get("channel"),
+        "duration": info.get("duration"),
+        "thumbnail": info.get("thumbnail"),
+        "formats": rows,
+    }
 
 
 @app.get("/transcript/{id}")
 def get_transcript(id: str):
     """Download auto-generated subtitles (original language) and store them as a
-    single-line plain-text transcript in $DATA_DIR/transcripts/<video_id>.txt."""
+    single-line plain-text transcript in $DATA_DIR/transcripts/<id>.txt."""
     target = normalize_target(id)
-
-    proc = run_ytdlp(["--skip-download", "--no-playlist", "--print", "%(id)s", target])
-    if proc.returncode != 0:
-        raise HTTPException(status_code=404, detail=proc.stderr.strip())
-    video_id = proc.stdout.strip()
+    info = get_info_json(target)
+    video_id = info.get("id")
     if not video_id:
         raise HTTPException(status_code=404, detail="Failed to extract video id")
 
@@ -219,10 +234,7 @@ def get_transcript(id: str):
         transcript_file = transcripts_dir / f"{video_id}.txt"
         transcript_file.write_text(transcript)
 
-    return {
-        "video_id": video_id,
-        "transcript_file": f"/{TRANSCRIPT_SUBDIR}/{video_id}.txt",
-    }
+    return _build_response(info, f"/{TRANSCRIPT_SUBDIR}/{video_id}.txt")
 
 
 @app.get("/video/{id}")
@@ -233,30 +245,24 @@ def download_video(
     """Download a video (always mp4, avc1 codec) into $DATA_DIR/videos/,
     then attach its thumbnail as cover art and set title/network/date metadata."""
     target = normalize_target(id)
+    info = get_info_json(target)
+    video_id = info.get("id")
     out_dir = DATA_DIR / VIDEO_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    before = {p.name for p in out_dir.iterdir()}
 
     args = [
-        "--output", str(out_dir / "%(title).200B.%(ext)s"),
+        "--output", str(out_dir / "%(id)s.%(ext)s"),
         "--no-playlist",
         "--format", quality,
         "--merge-output-format", "mp4",
         target,
     ]
-    result = run_download(args, out_dir)
+    file_name = run_download(args, out_dir)
+    video_file = out_dir / file_name
 
-    after = {p.name for p in out_dir.iterdir()}
-    new_names = after - before
-    if new_names:
-        video_name = max(new_names, key=lambda n: (out_dir / n).stat().st_size)
-    else:
-        video_name = max(after, key=lambda n: (out_dir / n).stat().st_size)
-    video_file = out_dir / video_name
+    embed_thumbnail(video_file, info, target)
 
-    embed_thumbnail(video_file, get_info_json(target), target)
-    result["files"] = sorted(p.name for p in out_dir.iterdir())
-    return result
+    return _build_response(info, f"/{VIDEO_SUBDIR}/{video_id}.mp4")
 
 
 @app.get("/audio/{id}")
@@ -266,15 +272,19 @@ def download_audio(
 ):
     """Download audio only (m4a) into $DATA_DIR/audios/."""
     target = normalize_target(id)
+    info = get_info_json(target)
+    video_id = info.get("id")
     out_dir = DATA_DIR / AUDIO_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     args = [
-        "--output", str(out_dir / "%(title).200B.%(ext)s"),
+        "--output", str(out_dir / "%(id)s.%(ext)s"),
         "--no-playlist",
         "--format", quality,
         "--extract-audio",
         "--audio-format", "m4a",
         target,
     ]
-    return run_download(args, out_dir)
+    run_download(args, out_dir)
+
+    return _build_response(info, f"/{AUDIO_SUBDIR}/{video_id}.m4a")
