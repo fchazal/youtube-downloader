@@ -35,6 +35,8 @@ app.mount(
 
 HTML_TAG_RE = re.compile(r"<[^>]*>")
 
+VIDEO_SUBDIR = "videos"
+AUDIO_SUBDIR = "audios"
 TRANSCRIPT_SUBDIR = "transcripts"
 
 
@@ -53,14 +55,6 @@ def normalize_target(video_id: str) -> str:
     if not video_id:
         raise HTTPException(status_code=400, detail="Empty video id")
     return f"https://www.youtube.com/watch?v={video_id}"
-
-
-def resolve_subdir(subdir: str) -> Path:
-    """Normalize the destination subdir under $DATA_DIR and create it if needed."""
-    subdir = subdir.strip() or "downloads"
-    out_dir = DATA_DIR / subdir
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
 
 
 def run_download(args: list[str], out_dir: Path) -> dict:
@@ -228,25 +222,22 @@ def get_transcript(id: str):
 @app.get("/video/{id}")
 def download_video(
     id: str,
-    quality: str = Query("", description="Raw yt-dlp format selector. Ex: bestvideo[width<=1280][height<=720][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4). Empty = best."),
-    ext: str = Query("", description="Preferred container: mp4, webm, mkv... Empty = yt-dlp default."),
-    subdir: str = Query("", description="Subdirectory under $DATA_DIR. Empty -> downloads."),
+    quality: str = Query("bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]", description="Raw yt-dlp format selector. Ex: bestvideo[width<=1920][height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)."),
 ):
-    """Download a video at a yt-dlp format selector into a subdirectory of $DATA_DIR,
+    """Download a video (always mp4, avc1 codec) into $DATA_DIR/videos/,
     then attach its thumbnail as cover art and set title/network/date metadata."""
     target = normalize_target(id)
-    out_dir = resolve_subdir(subdir)
+    out_dir = DATA_DIR / VIDEO_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     before = {p.name for p in out_dir.iterdir()}
 
     args = [
         "--output", str(out_dir / "%(title).200B.%(ext)s"),
         "--no-playlist",
+        "--format", quality,
+        "--merge-output-format", "mp4",
+        target,
     ]
-    if quality:
-        args += ["--format", quality]
-    if ext:
-        args += ["--merge-output-format", ext]
-    args += [target]
     result = run_download(args, out_dir)
 
     after = {p.name for p in out_dir.iterdir()}
@@ -265,19 +256,33 @@ def download_video(
 @app.get("/audio/{id}")
 def download_audio(
     id: str,
-    format: str = Query("mp3", description="Audio container: mp3, m4a, opus, wav..."),
-    quality: str = Query("bestaudio[ext=m4a]", description="Raw yt-dlp format selector for the source stream."),
-    subdir: str = Query("", description="Subdirectory under $DATA_DIR. Empty -> downloads."),
+    quality: str = Query("bestaudio[ext=m4a]/bestaudio", description="Raw yt-dlp format selector for the source audio stream."),
 ):
-    """Download audio only into a subdirectory of $DATA_DIR."""
+    """Download audio only (always mp4) into $DATA_DIR/audios/,
+    then attach its thumbnail as cover art and set title/network/date metadata."""
     target = normalize_target(id)
-    out_dir = resolve_subdir(subdir)
+    out_dir = DATA_DIR / AUDIO_SUBDIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    before = {p.name for p in out_dir.iterdir()}
+
     args = [
         "--output", str(out_dir / "%(title).200B.%(ext)s"),
         "--no-playlist",
         "--format", quality,
         "--extract-audio",
-        "--audio-format", format,
+        "--audio-format", "mp4",
         target,
     ]
-    return run_download(args, out_dir)
+    result = run_download(args, out_dir)
+
+    after = {p.name for p in out_dir.iterdir()}
+    new_names = after - before
+    if new_names:
+        audio_name = max(new_names, key=lambda n: (out_dir / n).stat().st_size)
+    else:
+        audio_name = max(after, key=lambda n: (out_dir / n).stat().st_size)
+    audio_file = out_dir / audio_name
+
+    embed_thumbnail(audio_file, get_info_json(target), target)
+    result["files"] = sorted(p.name for p in out_dir.iterdir())
+    return result
