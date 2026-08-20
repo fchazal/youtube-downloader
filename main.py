@@ -264,12 +264,10 @@ def download_audio(
     id: str,
     quality: str = Query("bestaudio[ext=m4a]/bestaudio", description="Raw yt-dlp format selector for the source audio stream."),
 ):
-    """Download audio only (always mp4) into $DATA_DIR/audios/,
-    then attach its thumbnail as cover art and set title/network/date metadata."""
+    """Download audio only (m4a) into $DATA_DIR/audios/."""
     target = normalize_target(id)
     out_dir = DATA_DIR / AUDIO_SUBDIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    before = {p.name for p in out_dir.iterdir()}
 
     args = [
         "--output", str(out_dir / "%(title).200B.%(ext)s"),
@@ -279,16 +277,4 @@ def download_audio(
         "--audio-format", "m4a",
         target,
     ]
-    result = run_download(args, out_dir)
-
-    after = {p.name for p in out_dir.iterdir()}
-    new_names = after - before
-    if new_names:
-        audio_name = max(new_names, key=lambda n: (out_dir / n).stat().st_size)
-    else:
-        audio_name = max(after, key=lambda n: (out_dir / n).stat().st_size)
-    audio_file = out_dir / audio_name
-
-    embed_thumbnail(audio_file, get_info_json(target), target)
-    result["files"] = sorted(p.name for p in out_dir.iterdir())
-    return result
+    return run_download(args, out_dir)
