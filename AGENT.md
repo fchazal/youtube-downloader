@@ -5,8 +5,9 @@ Everything needed to resume work on this project. Read this first.
 ## Overview
 
 A Dockerized HTTP API around [yt-dlp](https://github.com/yt-dlp/yt-dlp) that lets
-you fetch video metadata, list available formats/qualities, and download
-videos/audio/subtitles into dedicated subdirectories of a configurable data directory.
+you fetch metadata, download video/audio/cover/transcript/info **per video**, and
+delete them all at once. Files are grouped in one folder per video under a
+configurable data directory and served directly over HTTP.
 
 YouTube requires EJS (External JS Scripts) for challenge solving and PO Tokens
 (Proof of Origin) to avoid bot detection. Both are handled automatically via
@@ -24,14 +25,14 @@ from this repo's git URL.
 - **yt-dlp standalone binary** (installed in the image, self-updates at startup)
 - **Deno** JS runtime (EJS challenge solving + bgutil PO token server)
 - **bgutil-ytdlp-pot-provider** (PO Token generation via BotGuard attestation)
-- **ffmpeg** (audio extraction, format merging, subtitle embedding)
+- **ffmpeg** (format merging, thumbnail→JPEG conversion)
 - Docker (multi-stage build), Docker Compose for local dev
 
 ## Repo structure
 
 ```
 youtube-downloader/
-├── main.py              # FastAPI app: health, info, formats, download
+├── main.py              # FastAPI app: health, download, items
 ├── Dockerfile           # multi-stage: ffmpeg + yt-dlp binary + Python deps + Deno + bgutil
 ├── requirements.txt     # fastapi, uvicorn[standard], python-multipart
 ├── docker-compose.yml   # local dev (build: ., port 8000, ./data:/data)
@@ -43,7 +44,7 @@ youtube-downloader/
 ```
 
 Remote: `https://github.com/fchazal/youtube-downloader.git` (branch `main`).
-Current version: `1.0.0` (FastAPI app version + image tag `yt-dlp-api:latest`).
+Current version: `2.0.0` (FastAPI app version + image tag `yt-dlp-api:latest`).
 
 ## How it works
 
@@ -58,69 +59,64 @@ Current version: `1.0.0` (FastAPI app version + image tag `yt-dlp-api:latest`).
   block automated access. The
   [bgutil-ytdlp-pot-provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider)
   plugin is installed in `~/.config/yt-dlp/plugins/` and connects to an HTTP server
-  (`http://127.0.0.1:4416`) running inside the container. The server uses Deno +
-  BgUtils to generate PO tokens per-video. The `--extractor-args
+  (`http://127.0.0.1:4416`) running inside the container. The `--extractor-args
   "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416"` flag is set in
   `/etc/yt-dlp.conf`. The health endpoint reports `pot_provider: "ok" | "unavailable"`.
-- `normalize_target()` wraps a bare video ID into
-  `https://www.youtube.com/watch?v=<id>`. **URLs are not accepted** — the routes
-  use `{id}`, so only bare IDs work.
-- Downloads go into dedicated subdirectories under `$DATA_DIR`:
-  - `videos/` — video downloads (mp4, avc1 codec)
-  - `audios/` — audio downloads (mp4)
-  - `transcripts/` — plain-text transcripts
+- **Routes accept only bare video IDs** (`{video_id}`). `sanitize_id()` validates
+  against `^[A-Za-z0-9_-]+$` before any path usage (folder name / URL build);
+  `normalize_target()` wraps the ID into `https://www.youtube.com/watch?v=<id>`.
+- **Per-video folder layout** under `$DATA_DIR`:
+  ```
+  $DATA_DIR/<video_id>/
+  ├── video.m4v       # video (mp4/avc1; produced as .mp4 then os.replace → .m4v)
+  ├── audio.m4a       # audio only (--extract-audio --audio-format m4a)
+  ├── cover.jpg       # standalone thumbnail (ffmpeg convert of info.thumbnail)
+  ├── transcript.txt  # single-line plain text
+  └── info.json       # full yt-dlp metadata dump
+  ```
+  The five parts are declared in `PARTS`; `FILE_NAMES`/`MIME_TYPES` map each
+  part to its file name and served content type.
 - `run_ytdlp()` has a 3600 s timeout and captures output; errors are surfaced as
   HTTP errors (404 for unknown videos, 502 for download failures).
-- `GET /video/{id}` always produces **mp4 with avc1 codec**. The default format
-  selector is `bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]`.
-  A custom selector can be passed via the `quality` query param (must stay avc1/mp4).
-  Post-download, ffmpeg embeds the thumbnail as cover art and sets title/network/date
-  metadata.
-- `GET /audio/{id}` always produces **mp4 audio** via `--extract-audio --audio-format mp4`.
-  The default format selector is `bestaudio[ext=m4a]/bestaudio`. A custom selector
-  can be passed via the `quality` query param. Post-download, ffmpeg embeds the
-  thumbnail as cover art (same as video).
-- `GET /transcript/{id}` downloads the auto-generated subtitles in the original
-  language (`--skip-download --sub-format ttml --sub-langs ".*orig"` +
-  `--write-auto-subs`), strips the HTML/ttml tags, joins everything into a
-  single line, and writes `$DATA_DIR/transcripts/<video_id>.txt`. That directory
-  is meant to be served as public WebDAV. The response is
-  `{ "video_id": ..., "transcript_file": "/transcripts/<id>.txt" }`.
-- **WebDAV**: `wsgidav` is mounted on `/dav` via `WSGIMiddleware`, serving
-  `$DATA_DIR` **read-only** (`FilesystemProvider(..., readonly=True)`). Files are
-  addressed by their real name (`/dav/videos/<title>.mp4`,
-  `/dav/audios/<title>.mp4`, `/dav/transcripts/<id>.txt`). Anonymous access is granted by
-  `simple_dc.user_mapping: {"*": True}`; write methods return 403. The provider
-  must be mapped to `/` (Starlette strips the `/dav` mount prefix).
+- **`POST /download/{id}`** runs a **single `get_info_json()`** (one `yt-dlp -J`
+  extraction) reused by every requested part, then dispatches to per-part
+  downloaders. Video/audio each run their own download subprocess; transcript runs
+  a separate subtitle extraction (`--skip-download --sub-format ttml/vtt/best
+  --sub-langs <original-language> --write-subs` for uploaded tracks or
+  `--write-auto-subs` for generated ones, HTML/timestamp stripped, joined to one
+  line). The original language is resolved from `info.language`, `<lang>-orig`
+  auto-caption keys, and audio-format `language`/`language_preference` metadata;
+  yt-dlp no longer always exposes `-orig`, so the old `.*orig`-only selector is
+  kept only as a fallback.
+  Each part runs in its own `try/except`, so one failure (e.g. no subtitles) is
+  reported per-part and never breaks the others. Idempotent by default: existing
+  parts are `skipped` unless `?refresh=1`.
+- **Quality selectors** are passed as JSON body fields (`video_quality`,
+  `audio_quality`) — raw yt-dlp `--format` selectors, so `+`/`[]`/`^` need no
+  URL encoding anymore. Defaults match v1 (`bestvideo[ext=mp4][vcodec^=avc1]+
+  bestaudio[ext=m4a]/best[ext=mp4]` and `bestaudio[ext=m4a]/bestaudio`).
+- **No cover-art embedding anymore**: media files are not re-muxed with ffmpeg
+  after download (v1 embedded the thumbnail + title/network/date metadata).
+  The cover is a standalone `cover.jpg` only.
+- Files are served directly (`FileResponse`) with proper media types; media is
+  **streamed inline by default** (`content_disposition_type="inline"`, Starlette
+  handles `Range`/206 so players can seek). `?download=1` switches to
+  `attachment` with a filename. There is **no WebDAV** anymore.
 
 ## Endpoints
 
 | Method | Path                    | Description                          |
 | ------ | ----------------------- | ------------------------------------ |
 | GET    | `/`                     | Health + yt-dlp version + data_dir + pot_provider status |
-| GET    | `/info/{id}`           | Full yt-dlp metadata JSON            |
-| GET    | `/formats/{id}`        | Clean table of available formats     |
-| GET    | `/transcript/{id}`     | Plain-text transcript → `$DATA_DIR/transcripts/<video_id>.txt` |
-| GET    | `/video/{id}`          | Download video (mp4/avc1) → `$DATA_DIR/videos/` (`?quality=`) |
-| GET    | `/audio/{id}`          | Download audio (mp4) → `$DATA_DIR/audios/` (`?quality=`) |
-| GET    | `/dav/*`               | Read-only WebDAV over `$DATA_DIR` (wsgidav) |
+| POST   | `/download/{id}`        | Download parts (default: all 5). Body `{"parts":[...], "video_quality":..., "audio_quality":...}`. Query `?refresh=1` forces re-download |
+| GET    | `/{id}`                 | List which parts exist for a video   |
+| GET    | `/{id}/{part}`          | Serve the part file (streamed inline by default; `?download=1` forces attachment) |
+| DELETE | `/{id}`                 | Delete the whole video folder (all parts) |
+| DELETE | `/{id}/{part}`          | Delete one part                      |
 | GET    | `/docs`                 | Interactive OpenAPI UI               |
 
-### GET /video and GET /audio query params
-
-| Endpoint | Param     | Default   | Notes                                     |
-| -------- | --------- | --------- | ----------------------------------------- |
-| `/video` | `quality` | `bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]` | **Raw yt-dlp format selector**, passed as `--format`. Must target avc1/mp4. |
-| `/audio` | `quality` | `bestaudio[ext=m4a]/bestaudio` | Raw yt-dlp format selector for the source stream |
-
-> `+` inside a selector must be URL-encoded (`%2B`) in a query string; a raw `+`
-> decodes to a space. Use `curl -G --data-urlencode`.
-
-Example:
-```bash
-curl -G "localhost:8000/video/dQw4w9WgXcQ" \
-  --data-urlencode 'quality=bestvideo[width<=1920][height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)'
-```
+`{part}` ∈ `video | audio | cover | transcript | info`. Per-part response
+`status` ∈ `downloaded | skipped | error`.
 
 ## Configuration (env vars)
 
@@ -162,14 +158,13 @@ uvicorn main:app --host 0.0.0.0 --port 8000
 
 ```bash
 curl localhost:8000/                                  # health + version + pot_provider
-curl localhost:8000/info/dQw4w9WgXcQ                  # metadata
-curl localhost:8000/formats/dQw4w9WgXcQ               # available qualities
-curl localhost:8000/transcript/dQw4w9WgXcQ            # plain-text transcript
-curl -G "localhost:8000/audio/dQw4w9WgXcQ"            # audio mp4
-curl -G "localhost:8000/video/dQw4w9WgXcQ" \
-  --data-urlencode 'quality=bestvideo[width<=1920][height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)'
-curl -X PROPFIND -H "Depth: 1" localhost:8000/dav/     # WebDAV read-only listing
-ls data/videos/ data/audios/ data/transcripts/         # check output dirs
+curl -X POST localhost:8000/download/dQw4w9WgXcQ \
+  -H 'Content-Type: application/json' -d '{}'         # download everything
+curl localhost:8000/dQw4w9WgXcQ                       # state of the folder
+curl -o video.m4v localhost:8000/dQw4w9WgXcQ/video
+curl localhost:8000/dQw4w9WgXcQ/info                  # metadata JSON
+curl -X DELETE localhost:8000/dQw4w9WgXcQ             # delete everything
+ls data/                                              # folder gone
 ```
 
 ## Publishing
@@ -201,34 +196,51 @@ ls data/videos/ data/audios/ data/transcripts/         # check output dirs
   `subprocess` for it. Do not `import yt_dlp`.
 - yt-dlp self-update via `pip` fails; the standalone binary (`yt-dlp -U`) is
   what works. That's why the Dockerfile downloads the binary with curl.
-- `quality` on `/video` and `/audio` is a **raw yt-dlp format selector** passed
-  straight to `--format`. A `+` must be `%2B`-encoded in the query string, else
-  it decodes to a space. If a selector matches nothing, yt-dlp errors (502).
-- **Video**: always mp4 with avc1 codec. The default selector includes
-  `[vcodec^=avc1][ext=mp4]` constraints. Users can refine quality/resolution
-  but not change the codec or container.
-- **Audio**: always mp4. Uses `--extract-audio --audio-format mp4`.
-- Both `/video` and `/audio` call **ffmpeg** post-download to embed the
-  thumbnail + metadata. The remux uses `-c copy` (no re-encode), a temp file
-  in the same dir then `os.replace`.
-- **wsgidav** (deps: defusedxml, PyYAML) is a dependency for `/dav`; it is
-  mounted **after** the API routes but its `/dav` prefix never collides with
-  them. Logging is disabled via `logging.enable: False`.
+- `video_quality`/`audio_quality` are **raw yt-dlp format selectors** passed
+  straight to `--format`. They arrive in the JSON body, so no `+`→space
+  decoding issue. If a selector matches nothing, yt-dlp errors → that part gets
+  `status: error`.
+- **Video**: produced as mp4 (default selector keeps `[vcodec^=avc1][ext=mp4]`),
+  then the produced file is renamed to `video.m4v` via `os.replace`. The m4v
+  container is identical to mp4.
+- **Audio**: produced as m4a via `--extract-audio --audio-format m4a`, renamed
+  to `audio.m4a`.
+- **Cover**: `info.thumbnail` is downloaded and converted to `cover.jpg` with a
+  one-frame ffmpeg pass. There is **no re-mux/embed step** on the media files.
+- **Refresh semantics**: skip existing part unless `refresh=1`. `run_download()`
+  diffs the output directory before/after, so an existing canonical file
+  (`video.m4v`) is not mistaken for a fresh download; then `os.replace` swaps in
+  the new file atomically.
+- **Failure isolation**: each part is wrapped in try/except inside `/download`;
+  `HTTPException.detail` becomes the part `error`. A bad part never 500s the call.
+- **Route ordering matters**: FastAPI's default routes (`/docs`, `/openapi.json`,
+  `/redoc`) are registered first and always win. `GET /{video_id}` (list),
+  `GET /{video_id}/{part}` (serve), `DELETE /{video_id}` and
+  `DELETE /{video_id}/{part}` are generic. Keep their relative order (list before
+  part routes) and do not add new literal GET/DELETE routes after them, or the
+  generic single/two-segment routes would capture those paths.
+- **Path safety**: `sanitize_id()` (regex `^[A-Za-z0-9_-]+$`) guards every use of
+  `{video_id}` as a filesystem folder under `DATA_DIR`. Do not bypass it.
+- `POST /download` runs one metadata extraction even for a transcript-only
+  request (the transcript needs the folder id/title too). That means a fully
+  blocked video yields 404 even if you only wanted subtitles — acceptable tradeoff.
+- **wsgidav was removed in v2** — `/dav` no longer exists. Requirements are just
+  fastapi, uvicorn, python-multipart. Old v1 subdirectories
+  (`videos/`, `audios/`, `transcripts/`) from a previous data dir are **not**
+  migrated; delete them by hand if present.
+- `data/` is gitignored; a fresh `DATA_DIR` is auto-created at import time.
 - Container stop behavior is fine (tested ~1 s); the `sh -c` CMD works, but if
   slow stops ever appear, switch to `exec uvicorn …` or a tini entrypoint.
-- `data/` is gitignored; a fresh `DATA_DIR` is auto-created at import time.
-- **Subdirectories are fixed**: `videos/`, `audios/`, `transcripts/`. No
-  user-configurable subdir param anymore.
 
 ## Current status & possible next steps
 
-Done: info / formats / transcript endpoints, REST download interface
-(`GET /video?quality=`, `GET /audio?quality=` with raw yt-dlp selectors),
-thumbnail embedding + metadata on both video and audio, read-only WebDAV (`/dav`,
-wsgidav), `DATA_DIR` env, Docker image, local compose, publish script, CasaOS
-store app entry, EJS support (Deno JS runtime), PO Token provider
-(bgutil-ytdlp-pot-provider HTTP server on port 4416), fixed output directories
-(`videos/`, `audios/`, `transcripts/`).
+Done: v2 API — one-folder-per-video layout (`video.m4v`/`audio.m4a`/
+`cover.jpg`/`transcript.txt`/`info.json`), `POST /download/{id}` (single metadata
+extraction, all parts, idempotent, `?refresh=1`), `GET /{id}` (state),
+`GET /{id}/{part}` file serving (streamed inline, `?download=1`),
+`DELETE /{id}` (whole folder) and
+per-part delete, quality selectors in JSON body, cover as standalone JPEG
+(embedding removed), WebDAV removed.
 
 Possible next steps (not started): async downloads with job status, web UI,
 playlist export, per-request rate limiting, authentication, tests

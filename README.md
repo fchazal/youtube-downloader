@@ -14,94 +14,119 @@ plugin.
 
 ## Endpoints
 
-| Method | Path                    | Description                                  |
-| ------ | ----------------------- | -------------------------------------------- |
-| GET    | `/`                     | Health check + yt-dlp version + PO token provider status |
-| GET    | `/info/{id}`           | Full metadata/properties for a video ID     |
-| GET    | `/formats/{id}`        | List of available formats/qualities         |
-| GET    | `/transcript/{id}`     | Single-line plain-text transcript → `transcripts/<video_id>.txt` |
-| GET    | `/video/{id}`          | Download video (mp4/avc1) → `videos/<title>.mp4` |
-| GET    | `/audio/{id}`          | Download audio (mp4) → `audios/<title>.mp4` |
-| GET    | `/dav/*`               | Read-only WebDAV server over `$DATA_DIR` |
+| Method | Path                          | Description                                  |
+| ------ | ----------------------------- | -------------------------------------------- |
+| GET    | `/`                           | Health check + yt-dlp version + PO token provider status |
+| POST   | `/download/{id}`              | Download the requested parts for a video in **a single call** |
+| GET    | `/{id}`                       | List which parts are already stored for a video |
+| GET    | `/{id}/{part}`                | Serve a stored part file directly (streamed inline by default, `?download=1` to force) |
+| DELETE | `/{id}`                       | Delete **everything** for a video at once    |
+| DELETE | `/{id}/{part}`                | Delete a single part                         |
 
-All endpoints take a **bare YouTube video ID** (`/info/dQw4w9WgXcQ`).
+All endpoints take a **bare YouTube video ID** (`/download/dQw4w9WgXcQ`).
+
+`{part}` is one of: `video`, `audio`, `cover`, `transcript`, `info`.
 
 ### Directory structure
 
+Each video owns its folder; the file extensions are always the same:
+
 ```
 $DATA_DIR/
-├── videos/       # video downloads (mp4, avc1 codec)
-├── audios/       # audio downloads (mp4)
-└── transcripts/  # plain-text transcripts
+└── <video_id>/
+    ├── video.m4v      # video (mp4/avc1 container, renamed .m4v)
+    ├── audio.m4a      # audio only (AAC in m4a)
+    ├── cover.jpg      # thumbnail, standalone cover art
+    ├── transcript.txt # single-line plain-text transcript
+    └── info.json      # full yt-dlp metadata
 ```
 
-### GET /video/{id}
+### POST /download/{id}
 
-Downloads the video as **mp4 (avc1 codec)** with thumbnail embedded as cover art
-and `title`, `network` (watch URL) and `copyright` (upload date) metadata.
+Downloads several parts in **one call**. Already-present files are skipped
+unless `?refresh=1`. Each part is isolated, so a failure on one (e.g. no
+subtitles) does **not** affect the others and is reported in the response.
 
-| Query param | Default | Description                              |
-| ----------- | ------- | ---------------------------------------- |
-| `quality`   | `bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]` | Raw yt-dlp format selector |
+| Field            | Type     | Default        | Notes                                  |
+| ---------------- | -------- | -------------- | -------------------------------------- |
+| `parts`          | `string[]` | all five     | Which parts to fetch                   |
+| `video_quality`  | `string` | `bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]` | Raw yt-dlp format selector for the video |
+| `audio_quality`  | `string` | `bestaudio[ext=m4a]/bestaudio` | Raw yt-dlp format selector for the audio |
 
-Example selectors:
-
-```
-bestvideo[ext=mp4][vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]
-bestvideo[width<=1920][height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)
-bestvideo[height<=480][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)
-```
-
-> The `+` in a selector must be URL-encoded as `%2B` inside a query string (a raw
-> `+` decodes to a space). Use `curl -G --data-urlencode` to build the URL safely:
+> Passing quality selectors as JSON body means no more URL-encoding pain
+> (`+`, `[]`, `^` … are sent verbatim).
 
 ```bash
-curl -G "localhost:8000/video/dQw4w9WgXcQ" \
-  --data-urlencode 'quality=bestvideo[width<=1920][height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)'
+# Download everything for a video
+curl -X POST localhost:8000/download/dQw4w9WgXcQ \
+  -H 'Content-Type: application/json' -d '{}'
+
+# Only video + cover, custom resolution
+curl -X POST localhost:8000/download/dQw4w9WgXcQ \
+  -H 'Content-Type: application/json' \
+  -d '{"parts":["video","cover"],"video_quality":"bestvideo[height<=1080]+bestaudio"}'
+
+# Force a re-download even if files exist
+curl -X POST "localhost:8000/download/dQw4w9WgXcQ?refresh=1" \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
-### GET /audio/{id}
+Response — per-part `status` is `downloaded`, `skipped` or `error`:
 
-Downloads the audio track only as **mp4**, with thumbnail embedded as cover art.
+```json
+{
+  "id": "dQw4w9WgXcQ",
+  "title": "Rick Astley - Never Gonna Give You Up",
+  "requested": ["video", "audio", "cover", "transcript", "info"],
+  "parts": {
+    "video":      {"status": "downloaded", "path": "dQw4w9WgXcQ/video.m4v", "size_bytes": 10485760},
+    "audio":      {"status": "skipped",    "path": "dQw4w9WgXcQ/audio.m4a", "size_bytes": 3048832},
+    "cover":      {"status": "downloaded", "path": "dQw4w9WgXcQ/cover.jpg",  "size_bytes": 154321},
+    "transcript": {"status": "error", "error": "No subtitles found"},
+    "info":       {"status": "downloaded", "path": "dQw4w9WgXcQ/info.json", "size_bytes": 88213}
+  }
+}
+```
 
-| Query param | Default           | Description                          |
-| ----------- | ----------------- | ------------------------------------ |
-| `quality`   | `bestaudio[ext=m4a]/bestaudio` | Raw yt-dlp format selector for the source stream |
+### GET /{id}
+
+State of a video folder without downloading anything:
 
 ```bash
-curl -G "localhost:8000/audio/dQw4w9WgXcQ"
+curl localhost:8000/dQw4w9WgXcQ
+# {"id":"dQw4w9WgXcQ","title":"...","parts":{"video":{"present":true,...},...}}
 ```
 
-### GET /transcript/{id}
+### GET /{id}/{part}
 
-Downloads the auto-generated subtitles in the original language and writes them as
-a single-line plain-text transcript to `$DATA_DIR/transcripts/<video_id>.txt`
-(suitable for serving from a WebDAV-enabled directory).
+Serves the file directly with the right `Content-Type`
+(`video/mp4`, `audio/mp4`, `image/jpeg`, `text/plain`, `application/json`).
+Video/audio/cover are **streamed inline by default** (`Range` requests are
+supported, so seeking/scrubbing works in players). Append `?download=1` to force
+an attachment download. Returns `404` if the part has not been downloaded yet.
 
 ```bash
-curl localhost:8000/transcript/dQw4w9WgXcQ
-# {"video_id":"dQw4w9WgXcQ","transcript_file":"/transcripts/dQw4w9WgXcQ.txt"}
+# stream/read inline (open in a player/browser)
+curl localhost:8000/dQw4w9WgXcQ/video        # video stream (m4v)
+curl localhost:8000/dQw4w9WgXcQ/audio        # audio stream (m4a)
+curl localhost:8000/dQw4w9WgXcQ/cover        # image
+curl localhost:8000/dQw4w9WgXcQ/transcript   # plain text
+curl localhost:8000/dQw4w9WgXcQ/info         # full JSON metadata
+
+# force a download
+curl -o video.m4v "localhost:8000/dQw4w9WgXcQ/video?download=1"
+curl -o audio.m4a "localhost:8000/dQw4w9WgXcQ/audio?download=1"
 ```
 
-### WebDAV (read-only) — `/dav/*`
+### DELETE /{id} and DELETE /{id}/{part}
 
-A read-only [WebDAV](https://en.wikipedia.org/wiki/WebDAV) server (via
-`wsgidav`) exposes `$DATA_DIR` so downloaded files can be browsed, mounted or
-synced (Finder, rclone, davfs…). Files are served **by their real name**:
-
-```
-/dav/videos/<title>.mp4       # video downloads
-/dav/audios/<title>.mp4       # audio downloads
-/dav/transcripts/<video_id>.txt # plain-text transcripts
-```
-
-- Write methods (`PUT`, `DELETE`, `MKCOL`, …) return `403`.
-- The directory listing at `/dav/` is a browsable HTML index.
-- URL-encode spaces in file names (`%20`).
+Removes the whole video folder (all parts at once) or a single part.
 
 ```bash
-curl -X PROPFIND -H "Depth: 1" localhost:8000/dav/
-curl localhost:8000/dav/videos/
+curl -X DELETE localhost:8000/dQw4w9WgXcQ
+# {"id":"dQw4w9WgXcQ","deleted":["video","audio","cover","transcript","info"]}
+curl -X DELETE localhost:8000/dQw4w9WgXcQ/cover
+# {"id":"dQw4w9WgXcQ","part":"cover","deleted":true}
 ```
 
 ## Configuration
@@ -134,11 +159,11 @@ Then:
 
 ```bash
 curl localhost:8000/
-curl localhost:8000/info/dQw4w9WgXcQ
-curl localhost:8000/transcript/dQw4w9WgXcQ
-curl -G "localhost:8000/audio/dQw4w9WgXcQ"
-curl -G "localhost:8000/video/dQw4w9WgXcQ" \
-  --data-urlencode 'quality=bestvideo[width<=1920][height<=1080][vcodec^=avc1][ext=mp4]+bestaudio[ext=m4a]/(mp4)'
+curl -X POST localhost:8000/download/dQw4w9WgXcQ -H 'Content-Type: application/json' -d '{}'
+curl localhost:8000/dQw4w9WgXcQ
+curl -o cover.jpg localhost:8000/dQw4w9WgXcQ/cover
+ls data/dQw4w9WgXcQ/
+curl -X DELETE localhost:8000/dQw4w9WgXcQ
 ```
 
 Interactive API docs: http://localhost:8000/docs
@@ -155,9 +180,15 @@ Interactive API docs: http://localhost:8000/docs
   plugin runs an HTTP server on port 4416 inside the container, generating PO
   tokens automatically via BgUtils. The health endpoint reports
   `pot_provider: "ok" | "unavailable"`.
-- **ffmpeg** is bundled for audio extraction, format merging, subtitle embedding,
-  thumbnail cover-art.
-- **WebDAV** is served by `wsgidav` (read-only), mounted at `/dav` over
-  `$DATA_DIR`.
+- **ffmpeg** is bundled for format merging and thumbnail→JPEG conversion.
+- `POST /download` runs a **single metadata extraction** per call and reuses it
+  for every requested part. Video and audio downloads run in their own yt-dlp
+  subprocess each; the transcript uses a separate subtitle extraction targeting
+  the video's original language (uploaded subtitles when available, otherwise
+  auto-generated ones).
+- Cover art is **not** embedded into the media files anymore: it is stored as a
+  standalone `cover.jpg` next to the media.
+- The video container is mp4/avc1 (as selected by default); the produced file is
+  simply renamed `.m4v` for clarity.
 - The API shells out to the `yt-dlp` binary (subprocess) rather than importing
   the Python module, so the binary is the single source of truth.
